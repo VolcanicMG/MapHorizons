@@ -1,0 +1,82 @@
+plugins {
+    id 'java-library'
+    id 'net.neoforged.moddev' version '2.0.148'
+}
+
+tasks.named('wrapper', Wrapper).configure {
+    distributionType = Wrapper.DistributionType.BIN
+}
+
+version = mod_version
+group = mod_group_id
+
+base {
+    archivesName = mod_id
+}
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+
+neoForge {
+    version = project.neo_version
+
+    runs {
+        client {
+            client()
+        }
+        server {
+            server()
+            programArgument '--nogui'
+        }
+    }
+
+    mods {
+        "${mod_id}" {
+            sourceSet(sourceSets.main)
+        }
+    }
+}
+
+// Exact pack jars (copied into the gitignored libs/ dir); compile-only so API drift fails the build.
+dependencies {
+    compileOnly files(
+            'libs/xaeroworldmap-neoforge-1.21.1-1.47.0.jar',
+            // Bundled inside the Xaero jars (META-INF/jarjar).
+            'libs/xaerolib-neoforge-1.21.1-1.7.3.jar',
+            'libs/DistantHorizons-3.3.1-1.21.1-fabric-neoforge.jar',
+            'libs/ftb-teams-neoforge-2101.1.11.jar',
+            'libs/architectury-13.0.11-neoforge.jar'
+    )
+}
+
+// The one runnable check: assert-based, no test framework dependency.
+tasks.register('selfCheck', JavaExec) {
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.volcanicmg.maphorizons.SelfCheck'
+    jvmArgs '-ea'
+}
+tasks.named('check') { dependsOn 'selfCheck' }
+// No JUnit tests; the self-check above is the test.
+tasks.named('test') { failOnNoDiscoveredTests = false }
+
+var generateModMetadata = tasks.register("generateModMetadata", ProcessResources) {
+    var replaceProperties = [
+            minecraft_version      : minecraft_version,
+            minecraft_version_range: minecraft_version_range,
+            neo_version            : neo_version,
+            loader_version_range   : loader_version_range,
+            mod_id                 : mod_id,
+            mod_name               : mod_name,
+            mod_license            : mod_license,
+            mod_version            : mod_version,
+    ]
+    inputs.properties replaceProperties
+    expand replaceProperties
+    from "src/main/templates"
+    into "build/generated/sources/modMetadata"
+}
+sourceSets.main.resources.srcDir generateModMetadata
+neoForge.ideSyncTask generateModMetadata
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}

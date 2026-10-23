@@ -1,0 +1,18 @@
+{
+  "maphorizons.configuration.title": "MapHorizons",
+  "maphorizons.configuration.section.maphorizons.client.toml": "Client settings",
+  "maphorizons.configuration.section.maphorizons.client.toml.title": "MapHorizons client settings",
+  "maphorizons.configuration.section.maphorizons.server.toml": "Server settings",
+  "maphorizons.configuration.section.maphorizons.server.toml.title": "MapHorizons server settings",
+  "maphorizons.configuration.teamScoped": "Team scoped (FTB Teams)",
+  "maphorizons.configuration.shareWithAllies": "Share with allies",
+  "maphorizons.configuration.showUnexploredTerrain": "Show unexplored terrain",
+  "maphorizons.configuration.syncIntervalSeconds": "Sync interval (seconds)",
+  "maphorizons.configuration.enabled": "Enabled",
+  "maphorizons.configuration.colorMode": "Colour mode",
+  "maphorizons.configuration.cacheRegions": "Cached regions",
+  "maphorizons.configuration.shadeStrength": "Slope shading",
+  "maphorizons.configuration.paintWithoutServer": "Paint without server mod",
+  "maphorizons.configuration.debugLogging": "Debug logging",
+  "maphorizons.config.button": "MapHorizons…"
+}

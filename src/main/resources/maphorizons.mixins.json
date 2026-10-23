@@ -1,0 +1,14 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.volcanicmg.maphorizons.mixin",
+  "plugin": "com.volcanicmg.maphorizons.client.xaero.TerrainMixinPlugin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "LeafTextureMixin",
+    "RegistryMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
