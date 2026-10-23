@@ -62,6 +62,15 @@ public final class Bits {
         return 1L << (Math.floorMod(tz, 8) * 8 + Math.floorMod(tx, 8));
     }
 
+    /** @return true if any of the 4x4 chunks of DH leaf tile (tx, tz) is set in its region's bitset */
+    public static boolean anyInTile(long[] words, int tx, int tz) {
+        if (words == null) return false;
+        for (int dz = 0; dz < 4; dz++)
+            for (int dx = 0; dx < 4; dx++)
+                if (get(words, tx * 4 + dx, tz * 4 + dz)) return true;
+        return false;
+    }
+
     public static boolean any(long[] words) {
         if (words == null) return false;
         for (long w : words) if (w != 0) return true;

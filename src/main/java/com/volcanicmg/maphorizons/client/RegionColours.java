@@ -61,6 +61,9 @@ public final class RegionColours {
     private static final Map<Key, Integer> VERSIONS = new ConcurrentHashMap<>();
     private static final Set<Key> PENDING = ConcurrentHashMap.newKeySet();
     private static final Map<Key, Long> RETRY_AT = new ConcurrentHashMap<>();
+    private static final long REFRESH_DEBOUNCE_MS = 1500;
+    private static final Map<Key, Long> LAST_REFRESH = new ConcurrentHashMap<>();
+    private static final Set<Key> DEFERRED = ConcurrentHashMap.newKeySet();
     private static volatile int epoch;
     // Bumped by clearAll; a compute started before a clear must not store old-mode colours.
     private static final java.util.concurrent.atomic.AtomicInteger GENERATION = new java.util.concurrent.atomic.AtomicInteger();
@@ -107,6 +110,32 @@ public final class RegionColours {
      */
     public static void refresh(ResourceLocation dim, int rx, int rz) {
         Key k = new Key(dim, Bits.pack(rx, rz));
+        long now = System.currentTimeMillis();
+        Long last = LAST_REFRESH.get(k);
+        // Streaming sections would otherwise recompute a region every tick.
+        if (last != null && now - last < REFRESH_DEBOUNCE_MS) {
+            DEFERRED.add(k);
+            return;
+        }
+        LAST_REFRESH.put(k, now);
+        refreshNow(k);
+    }
+
+    /** Main thread, each tick: run refreshes that were held back by the debounce. */
+    public static void flushDeferred() {
+        if (DEFERRED.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        for (var it = DEFERRED.iterator(); it.hasNext(); ) {
+            Key k = it.next();
+            Long last = LAST_REFRESH.get(k);
+            if (last != null && now - last < REFRESH_DEBOUNCE_MS) continue;
+            it.remove();
+            LAST_REFRESH.put(k, now);
+            refreshNow(k);
+        }
+    }
+
+    private static void refreshNow(Key k) {
         boolean cached;
         synchronized (CACHE) {
             cached = CACHE.containsKey(k);
@@ -181,6 +210,8 @@ public final class RegionColours {
             CACHE.keySet().removeIf(k -> k.dim().equals(dim));
         }
         RETRY_AT.keySet().removeIf(k -> k.dim().equals(dim));
+        LAST_REFRESH.keySet().removeIf(k -> k.dim().equals(dim));
+        DEFERRED.removeIf(k -> k.dim().equals(dim));
     }
 
     private static void bump(Key k) {

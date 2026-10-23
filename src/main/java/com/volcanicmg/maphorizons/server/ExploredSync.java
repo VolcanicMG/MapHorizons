@@ -19,6 +19,7 @@ import java.util.function.Function;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.neoforged.fml.ModList;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 import net.neoforged.neoforge.event.level.ChunkWatchEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
@@ -108,18 +109,28 @@ public final class ExploredSync {
 
     private static void sync(ServerPlayer viewer, ExploredData data, boolean full) {
         if (!viewer.connection.hasChannel(ExploredPayload.TYPE)) return;
-        Set<UUID> sources = Config.TEAM_SCOPED.get() && teamSources != null ? teamSources.apply(viewer) : null;
+        Set<UUID> sources = sourcesFor(viewer);
         boolean unexplored = Config.SHOW_UNEXPLORED_TERRAIN.get();
-        if (unexplored && sources == null) {
-            // Full atlas: nothing to scope.
-            if (full) PacketDistributor.sendToPlayer(viewer, new ExploredPayload(true, true, false, List.of(), List.of()));
-            return;
-        }
-        Collection<UUID> from = sources == null ? data.players() : sources;
-        List<ExploredPayload.Regions> mine = collect(data, from, full);
-        List<ExploredPayload.Regions> anyone = unexplored ? collect(data, data.players(), full) : List.of();
+        // Full atlas: painting needs no sets, but "explored by anyone" still says what may be fetched.
+        boolean unrestricted = unexplored && sources == null;
+        List<ExploredPayload.Regions> mine = unrestricted ? List.of()
+                : collect(data, sources == null ? data.players() : sources, full);
+        // Only when the client paints unexplored land or everything; in team mode it would leak other teams' trails.
+        // Open mode without unexplored painting needs no separate set: mine is already everyone's.
+        List<ExploredPayload.Regions> anyone = unrestricted || unexplored ? collect(data, data.players(), full) : List.of();
         if (!full && mine.isEmpty() && anyone.isEmpty()) return;
-        send(viewer, full, unexplored, mine, anyone);
+        send(viewer, full, unrestricted, unexplored, shareProtocol(), mine, anyone);
+    }
+
+    /** Players whose exploration this viewer may see; null = everyone (no team scoping). */
+    public static Set<UUID> sourcesFor(ServerPlayer viewer) {
+        return Config.TEAM_SCOPED.get() && teamSources != null ? teamSources.apply(viewer) : null;
+    }
+
+    // ShareServer touches DH classes; only reached when DH is installed.
+    private static int shareProtocol() {
+        if (!Config.SHARE_TERRAIN.get() || !ModList.get().isLoaded("distanthorizons")) return 0;
+        return ShareServer.protocol();
     }
 
     /** OR of the sources' bitsets, for all their regions (full) or only regions changed this interval. */
@@ -155,14 +166,16 @@ public final class ExploredSync {
         return out;
     }
 
-    private static void send(ServerPlayer viewer, boolean full, boolean anyoneSent, List<ExploredPayload.Regions> mine,
+    private static void send(ServerPlayer viewer, boolean full, boolean unrestricted, boolean paintUnexplored,
+                             int protocol, List<ExploredPayload.Regions> mine,
                              List<ExploredPayload.Regions> anyone) {
         List<ExploredPayload.Regions> m = new ArrayList<>(), a = new ArrayList<>();
         int[] weight = {0};
         boolean[] first = {true};
         Runnable flush = () -> {
             PacketDistributor.sendToPlayer(viewer,
-                    new ExploredPayload(first[0] && full, false, anyoneSent, List.copyOf(m), List.copyOf(a)));
+                    new ExploredPayload(first[0] && full, unrestricted, paintUnexplored, protocol, List.copyOf(m),
+                            List.copyOf(a)));
             first[0] = false;
             m.clear();
             a.clear();

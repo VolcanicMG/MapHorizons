@@ -5,6 +5,8 @@ import com.volcanicmg.maphorizons.Config;
 import com.volcanicmg.maphorizons.client.Diagnostics;
 import com.volcanicmg.maphorizons.client.ExploredClient;
 import com.volcanicmg.maphorizons.client.RegionColours;
+import com.volcanicmg.maphorizons.client.ShareFetch;
+import com.volcanicmg.maphorizons.Bits;
 import com.volcanicmg.maphorizons.client.dh.DhSource;
 import java.util.List;
 import net.minecraft.network.chat.Component;
@@ -50,9 +52,13 @@ public final class TerrainHighlighter extends ChunkHighlighter {
             ResourceLocation d = dim.location();
             if (!on()) return false;
             Diagnostics.REGION_QUERIES.incrementAndGet();
+            boolean sharing = ShareFetch.enabled();
+            // On screen: missing sections here may be fetched from the server.
+            if (sharing) ShareFetch.note(d, rx, rz);
             if (!DhSource.hasRegion(d, rx, rz)) {
                 Diagnostics.REGION_NO_DH_DATA.incrementAndGet();
-                return false;
+                // Keep the region alive while shared sections may still arrive.
+                return sharing && Bits.any(ExploredClient.fetchableRegion(d, rx, rz));
             }
             if (!ExploredClient.anyAllowed(d, rx, rz)) {
                 Diagnostics.REGION_NOT_ALLOWED.incrementAndGet();

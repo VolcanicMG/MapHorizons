@@ -48,9 +48,13 @@ public final class MapHorizonsClient {
                 RegionColours.clearAll();
             });
         });
-        NeoForge.EVENT_BUS.addListener(ClientTickEvent.Post.class, e -> DhSource.tick());
+        NeoForge.EVENT_BUS.addListener(ClientTickEvent.Post.class, e -> {
+            DhSource.tick();
+            ShareFetch.tick();
+        });
         NeoForge.EVENT_BUS.addListener(ClientPlayerNetworkEvent.LoggingOut.class, e -> {
             DhSource.reset();
+            ShareFetch.reset();
             // Biome holders in the colour cache belong to that connection's registries.
             XaeroColours.clear();
         });

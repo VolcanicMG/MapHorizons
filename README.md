@@ -21,13 +21,15 @@ sends to clients that have it. A dedicated server never loads Xaero, Distant Hor
 
 ## Modes
 
-The server tracks which chunks each player has actually been sent ("explored"), per dimension.
+By default MapHorizons paints everything your Distant Horizons has. Team scoping is an opt-in restriction: the
+server tracks which chunks each player has actually been sent ("explored"), per dimension, and can limit painting
+to those.
 
 | Mode | Server config | What you see painted |
 |---|---|---|
-| Team (default) | FTB Teams installed, `teamScoped=true` | What anyone on your team or an allied team explored (`shareWithAllies=false` limits it to your team) |
-| Open | no FTB Teams, or `teamScoped=false` | What any player explored |
-| Full atlas | `showUnexploredTerrain=true` and no team scoping | All Distant Horizons data |
+| Full atlas (default) | `teamScoped=false`, `showUnexploredTerrain=true` | All Distant Horizons data |
+| Open | `teamScoped=false`, `showUnexploredTerrain=false` | What any player explored |
+| Team | FTB Teams installed, `teamScoped=true` | What anyone on your team or an allied team explored (`shareWithAllies=false` limits it to your team) |
 
 With team scoping and `showUnexploredTerrain=true` you see your team's exploration plus everything nobody has
 explored; only other teams' explored areas stay hidden.
@@ -42,6 +44,15 @@ the 3D view. Team scoping only decides what appears on Xaero's map.
 **Exploration from before the mod was installed is not credited.** Teammates' older travels appear once someone
 revisits those chunks.
 
+## Terrain sharing (multiplayer)
+
+With Distant Horizons on the server too, MapHorizons fills in terrain your own DH has never received: the client
+asks the server for the 64x64-block DH sections it is allowed to see (team mode: your team's and allies'
+exploration; otherwise anything any player explored), nearest first, and stores them in your DH data. They then
+appear on Xaero's maps and in DH's 3D view, and stay after you log out. Bandwidth is limited per player and in
+total. Both sides need the same Distant Horizons network protocol; singleplayer never uses it. Sharing works per
+64x64-block section, so in team mode it can reveal up to ~48 blocks beyond the edge of what your team explored.
+
 ## Nether
 
 Ceiling dimensions (the Nether) paint the floor under the bedrock roof, matching what Xaero shows there: the roof
@@ -54,10 +65,13 @@ Server (`<world>/serverconfig/maphorizons-server.toml`):
 
 | Key | Default | Meaning |
 |---|---|---|
-| `teamScoped` | `true` | Scope to FTB Teams teams when FTB Teams is installed. |
-| `shareWithAllies` | `true` | Also include FTB Teams allies. |
-| `showUnexploredTerrain` | `false` | Also paint terrain nobody explored (full atlas without team scoping). |
+| `teamScoped` | `false` | Opt-in: restrict painting to your FTB Teams team's exploration. |
+| `shareWithAllies` | `true` | With `teamScoped`: also include FTB Teams allies. |
+| `showUnexploredTerrain` | `true` | Paint terrain nobody explored (full atlas without team scoping). |
 | `syncIntervalSeconds` | `5` | Seconds between exploration syncs. |
+| `shareTerrain` | `true` | Send players DH terrain they may see but have not loaded (needs DH on the server). |
+| `shareKBps` | `512` | Sharing bandwidth per player, KB/s. |
+| `shareGlobalKBps` | `4096` | Sharing bandwidth for all players, KB/s. |
 
 Client (`config/maphorizons-client.toml`):
 
@@ -68,6 +82,7 @@ Client (`config/maphorizons-client.toml`):
 | `cacheRegions` | `48` | 512x512-block colour regions kept in memory (~1 MB each). |
 | `shadeStrength` | `1.0` | Slope shading against the north/west neighbours (about Xaero's); `0` is flat. |
 | `paintWithoutServer` | `true` | Paint all DH data on servers without MapHorizons. |
+| `fetchMaxDistance` | `16384` | Only fetch shared terrain within this many blocks. |
 | `debugLogging` | `false` | Log each painted region to `latest.log`. |
 
 ## Holes in the painting

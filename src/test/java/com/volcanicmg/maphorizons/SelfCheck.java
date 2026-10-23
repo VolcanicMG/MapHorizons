@@ -9,6 +9,8 @@ public final class SelfCheck {
         surface();
         nether();
         colour();
+        coarse();
+        share();
         System.out.println("MapHorizons self-check passed");
     }
 
@@ -49,6 +51,11 @@ public final class SelfCheck {
         check(s == 2, "highest non-air is the water");
         check(depth(top, bottom, air, liquid, s) == 4, "water depth to stone");
         check(TerrainMath.floorBelow(TerrainMath.byTopDescending(top), top, air, liquid, s) == 1, "floor under water");
+        // Regression: dry land over an underground water pocket (aquifer/cave) paints as land, not water.
+        int[] lTop = {320, 71, 60, 50}, lBottom = {71, 60, 50, 0};
+        boolean[] lAir = {true, false, false, false}, lLiquid = {false, false, true, false};
+        int land = pick(lTop, lBottom, lAir, false, 0);
+        check(land == 1 && !lLiquid[land], "land over an aquifer is land");
         check(pick(new int[]{100}, new int[]{0}, new boolean[]{true}, false, 0) == -1, "all air");
         check(java.util.Arrays.equals(TerrainMath.byTopDescending(new int[]{5, 9, 1, 7}), new int[]{1, 3, 0, 2}),
                 "order by top");
@@ -91,8 +98,59 @@ public final class SelfCheck {
         // See-through water: shallow shows more floor (red here) than deep.
         int shallow = TerrainMath.blendWater(0x0000FF, 0xFF0000, 1), deep = TerrainMath.blendWater(0x0000FF, 0xFF0000, 20);
         check((shallow >> 16 & 0xFF) > (deep >> 16 & 0xFF) && (deep >> 16 & 0xFF) > 0, "water depth blend");
+        // Deep water must read as water, not as the floor under a tint.
+        check((deep >> 16 & 0xFF) < 0x20 && (deep & 0xFF) > 0x90, "deep water is water-coloured");
         check(TerrainMath.tint(0xFFFFFF, 0x7FB238) == 0x7FB238 && TerrainMath.tint(0x808080, 0xFFFFFF) == 0x808080,
                 "texture times tint");
+    }
+
+    private static void coarse() {
+        // DH rough pass: 4x4-block squares stepping up one block each square, east and south.
+        int n = 32;
+        int[] h = new int[n * n];
+        for (int z = 0; z < n; z++) for (int x = 0; x < n; x++) h[z * n + x] = 64 + x / 4 + z / 4;
+        double[] s = TerrainMath.blur(h, n, 8);
+        int base = 0x808080;
+        int minB = 255, maxB = 0;
+        for (int z = 9; z < n - 9; z++)
+            for (int x = 9; x < n - 9; x++) {
+                int i = z * n + x;
+                int b = TerrainMath.shade(base, s[i], s[i - n], s[i - 1], 1.0) & 0xFF;
+                minB = Math.min(minB, b);
+                maxB = Math.max(maxB, b);
+            }
+        // Smoothed: one even slope, no bright lines at square edges.
+        check(maxB - minB <= 2, "coarse steps shade as a gentle gradient, not a grid");
+        // Raw shading of the same pattern would show the grid; full detail keeps it (real 1-block cliff).
+        int edge = TerrainMath.shade(base, 65, 64, 65, 1.0) & 0xFF, inside = TerrainMath.shade(base, 65, 65, 65, 1.0) & 0xFF;
+        check(edge > inside, "full-detail 1-block cliff still shades");
+    }
+
+    private static void share() {
+        // Section validation: a 64x64 leaf tile is allowed if any of its 16 chunks was explored.
+        long[] words = new long[Bits.WORDS];
+        Bits.set(words, 13, 6); // chunk (13,6) lies in tile (3,1): chunks 12..15 x 4..7
+        check(Bits.anyInTile(words, 3, 1), "explored chunk allows its tile");
+        check(!Bits.anyInTile(words, 2, 1) && !Bits.anyInTile(words, 3, 2), "neighbouring tiles stay locked");
+        check(!Bits.anyInTile(null, 0, 0), "unexplored region locks everything");
+        long[] neg = new long[Bits.WORDS];
+        Bits.set(neg, -1, -1); // tile (-1,-1), last tile of region (-1,-1)
+        check(Bits.anyInTile(neg, -1, -1) && Bits.tileRegionKey(-1, -1) == Bits.regionKey(-1, -1), "negative tile");
+
+        // Token bucket: one second of burst, then the rate.
+        com.volcanicmg.maphorizons.share.TokenBucket b = new com.volcanicmg.maphorizons.share.TokenBucket(1000, 0);
+        check(b.ready(0), "starts full");
+        b.charge(3000, 0);
+        check(!b.ready(1000), "over-spend waits");
+        check(b.ready(2500), "refills at the rate");
+
+        // Batch splitting under the packet cap; an oversized item goes alone.
+        var ends = com.volcanicmg.maphorizons.share.ShareMath.splitBySize(new int[]{200, 200, 200, 900, 100}, 480);
+        check(ends.equals(java.util.List.of(2, 3, 4, 5)), "batches by size " + ends);
+        check(com.volcanicmg.maphorizons.share.ShareMath.splitBySize(new int[0], 480).isEmpty(), "empty batch");
+        // Oversized section becomes "missing" instead of a packet the client would reject.
+        check(com.volcanicmg.maphorizons.share.ShareMath.fitOrMissing(new byte[1000], 1000).length == 0, "oversize is missing");
+        check(com.volcanicmg.maphorizons.share.ShareMath.fitOrMissing(new byte[900], 1000).length == 900, "fits as is");
     }
 
     private static void check(boolean ok, String what) {

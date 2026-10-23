@@ -74,12 +74,15 @@ public final class TerrainMath {
     }
 
     /**
-     * See-through water like Xaero's: the floor shows through shallow water, deep water is mostly water colour.
+     * See-through water like Xaero's: each block of water takes one of 15 light levels off the floor
+     * (Xaero's {@code Overlay.increaseOpacity(getLightBlock)}), and the water layer sits on top at a fixed
+     * opacity. Shallow water shows the floor; from ~10 blocks it is water colour over a dark floor.
      *
-     * @return water blended over the floor colour
+     * @return water blended over the depth-darkened floor colour
      */
     public static int blendWater(int water, int floor, int depth) {
-        double a = Math.min(0.9, 0.45 + depth * 0.05);
+        floor = scale(floor, Math.max(0.15, 1.0 - depth / 15.0));
+        double a = 0.6;
         int r = (int) Math.round((water >> 16 & 0xFF) * a + (floor >> 16 & 0xFF) * (1 - a));
         int g = (int) Math.round((water >> 8 & 0xFF) * a + (floor >> 8 & 0xFF) * (1 - a));
         int b = (int) Math.round((water & 0xFF) * a + (floor & 0xFF) * (1 - a));
@@ -104,8 +107,45 @@ public final class TerrainMath {
      * lower. One block of rise against both is about +16% at strength 1.
      */
     public static int shade(int rgb, int h, int hNorth, int hWest, double strength) {
-        int d = Math.max(-4, Math.min(4, (h - hNorth) + (h - hWest)));
+        return shade(rgb, (double) h, hNorth, hWest, strength);
+    }
+
+    /** Same as the int version, for smoothed (fractional) heights. */
+    public static int shade(int rgb, double h, double hNorth, double hWest, double strength) {
+        double d = Math.max(-4, Math.min(4, (h - hNorth) + (h - hWest)));
         return scale(rgb, 1.0 + d * 0.08 * strength);
+    }
+
+    /**
+     * Separable box blur of an n x n height field ({@link Integer#MIN_VALUE} = no data, ignored). Used for
+     * DH's coarse first-pass terrain, whose 2x2..16x16 blocky runs would otherwise shade as a grid of steps.
+     *
+     * @return blurred heights; cells with no data in their window keep their raw value
+     */
+    public static double[] blur(int[] h, int n, int r) {
+        double[] tmp = new double[n * n], out = new double[n * n];
+        int[] cnt = new int[n * n];
+        for (int z = 0; z < n; z++) {
+            double sum = 0;
+            int c = 0;
+            for (int x = -r; x < n; x++) {
+                int add = x + r, rem = x - r - 1;
+                if (add < n && h[z * n + add] != Integer.MIN_VALUE) { sum += h[z * n + add]; c++; }
+                if (rem >= 0 && h[z * n + rem] != Integer.MIN_VALUE) { sum -= h[z * n + rem]; c--; }
+                if (x >= 0) { tmp[z * n + x] = sum; cnt[z * n + x] = c; }
+            }
+        }
+        for (int x = 0; x < n; x++) {
+            double sum = 0;
+            int c = 0;
+            for (int z = -r; z < n; z++) {
+                int add = z + r, rem = z - r - 1;
+                if (add < n) { sum += tmp[add * n + x]; c += cnt[add * n + x]; }
+                if (rem >= 0) { sum -= tmp[rem * n + x]; c -= cnt[rem * n + x]; }
+                if (z >= 0) out[z * n + x] = c > 0 ? sum / c : h[z * n + x];
+            }
+        }
+        return out;
     }
 
     static int scale(int rgb, double f) {

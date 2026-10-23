@@ -65,9 +65,12 @@ Pin `distanthorizons` to `[3.3,3.4)`; catch `LinkageError` and disable cleanly.
 - Team changes: FTB architectury `TeamEvent` (`PLAYER_CHANGED`, `PLAYER_JOINED_PARTY`, `PLAYER_LEFT_PARTY`, `ADD_ALLY`, `REMOVE_ALLY`,
   `DELETED`) mark online members of old and new team for full resync. Leaving takes your exploration with you; joining brings it.
   All FTB code in one `FtbTeamsCompat`, only loaded when `ModList.isLoaded("ftbteams")`.
-- `showUnexploredTerrain` (default false): when true, the server also sends "explored by anyone" and the client paints its own set
+- Defaults (changed after the first multiplayer test): `teamScoped=false`, `showUnexploredTerrain=true`, i.e. paint
+  everything the client's DH has; team scoping is an opt-in restriction. Explored tracking and sync stay in place
+  (a later feature will send explored terrain beyond a player's own DH range).
+- `showUnexploredTerrain` (default true): when true, the server also sends "explored by anyone" and the client paints its own set
   plus everything nobody explored. With `teamScoped=false` it becomes "full atlas": send `unrestricted=true` and no sets.
-  Modes: team (default), open, full atlas.
+  Modes: full atlas (default), open, team.
 - Sync (MapColonies shape): optional channel `registrar("1").optional()`, guard sends with `hasChannel`. Full sync on login
   (FTB `TeamEvent.PLAYER_LOGGED_IN` when installed, else `PlayerLoggedInEvent`). Every `syncIntervalSeconds` (5): per-player
   changed-region sets; for each online viewer OR the changed regions of everyone they draw from, send those regions as
@@ -95,7 +98,7 @@ Pin `distanthorizons` to `[3.3,3.4)`; catch `LinkageError` and disable cleanly.
 5. `TerrainHighlighter extends xaero.map.highlight.ChunkHighlighter`, `super(true)`: DH index + allowed mask; cache miss ->
    null + enqueue; else copy 16 rows into `resultStore`. `getColors` and tooltips null.
 6. Server: `ExploredData`, `ExploredSync`, `FtbTeamsCompat`, `ExploredPayload`.
-7. Config. Server: `teamScoped=true`, `shareWithAllies=true`, `showUnexploredTerrain=false`, `syncIntervalSeconds=5`.
+7. Config. Server: `teamScoped=false`, `shareWithAllies=true`, `showUnexploredTerrain=true`, `syncIntervalSeconds=5`.
    Client: `enabled`, `cacheRegions`, `shadeStrength`, `paintWithoutServer=true`.
 8. One runnable check (`./gradlew selfCheck`, part of `build`): bitset upsert/OR/mask, surface pick/shading/packing on
    synthetic columns, and Nether columns (bedrock roof + air + netherrack floor, lava lake, no-gap fallback).
@@ -123,7 +126,9 @@ Pin `distanthorizons` to `[3.3,3.4)`; catch `LinkageError` and disable cleanly.
   BuiltInRegistries.BLOCK, pos)` (cached top-face texture colour, as Xaero's map uses) and `getBlockTintIndex(state)`,
   times the vanilla `BlockColors` tint for that index evaluated in the DH column's biome. Xaero's caches are not
   thread-safe, so unknown (state, biome) pairs are resolved in one main-thread hop per region and memoised.
-  Water is blended over the floor colour by depth (see-through water); lava is darkened by depth.
+  Water: the floor loses one of 15 light levels per block of water (as Xaero's overlay opacity does with
+  `getLightBlock`), then the water colour sits on top at 60%. The blend only happens when the painted point itself
+  is liquid; underground water never affects a dry column. Lava is darkened by depth.
 - DH: DH's `getBlockColorPreApi` (whole-model average, biome-tinted), with depth darkening for liquids.
 - Any Xaero failure switches the session to DH colours and logs once. Switching the mode clears our cache and
   repaints.
@@ -143,3 +148,69 @@ Not in v1: coarse-detail fallback, disk cache of colours, minimap-without-world-
 Night lighting of highlight-only pixels (alpha 0 may read as dark); minimap loading highlight-only regions with the world map
 closed; `getBlockColorPreApi` off-thread safety and cost; per-region read time and sync-request burst; how closely
 `ChunkWatchEvent.Sent` matches Xaero's write distance; minimap "use world map chunks" setting.
+
+## Terrain sharing beyond the player's own DH range (v1.1)
+
+Approved by Ethan 2026-10-23. Design spike by the Opus planner; DH facts verified in DH 3.3.1 (libs/).
+
+**Approach (A(i)):** the client pulls missing 64x64 leaf sections it is allowed to see; the server reads them
+from its own DH database and sends them in DH's own section format; the client inserts them into its DH store
+through DH's own update path. The existing listener, index and painting pick them up; they persist in the
+client's DH DB and DH also renders them in 3D. No new server storage.
+
+DH facts:
+- `core.sql.dto.FullDataSourceV2DTO` (pooled, implements `core.network.INetworkObject`): `encode(ByteBuf)`,
+  `decode(ByteBuf)`, `static CreateEmptyDataSourceForDecoding()`, `static CreateFromDataSource(FullDataSourceV2, EDhApiDataCompressionMode)`,
+  `FullDataSourceV2 createDataSource(ILevelWrapper, EDhDirection null)`, `close()`. The block-state table resolves by name on the receiving side.
+- DH's own client ingest (`DhClientLevel` real-time handlers): decode DTO -> `dto.createDataSource(levelWrapper, null)` ->
+  `level.updateDataSourcesAsync(src)` (on `IDhLevel`) -> `whenComplete(src.close())`, then `dto.close()`. `FullDataUpdaterV2.updateDataSource`
+  takes a per-position lock, merges column by column by generation step (no timestamp check), bakes skylight, `repo.save`, fires update listeners.
+- Server: `SharedApi.getAbstractDhWorld()` (DhServerWorld) `.getAllLoadedLevels()`; match by
+  `getLevelWrapper().getWrappedMcObject() instanceof ServerLevel sl && sl.dimension() == dim` (don't use `ServerLevelWrapper.getWrapper`: intermediary name).
+  `getFullDataProvider()` -> `GeneratedFullDataSourceProvider`; `provider.repo.getByKey(Long pos)` returns the stored, already compressed DTO.
+- Size: about 68 KB per leaf section (block data ~59 KB, states ~2 KB, edge data ~6.5 KB), max seen ~147 KB; ~4.3 MB per Xaero region.
+
+Changes:
+1. `DhSource`: read with `try (var dto = provider.repo.getByKey(pos)) { src = dto.createDataSource(level.getLevelWrapper(), null); }`
+   (close both) instead of `provider.get(pos)`. That avoids DH sync-on-load requests (out-of-range rejections for far sections).
+   Add `insert(dim, byte[])` using the ingest path above; only if the attached level object is unchanged; catch `DataCorruptedException`/errors and drop.
+2. Config. Server: `shareTerrain=true`, `shareKBps=512` (per player), `shareGlobalKBps=4096`. Client: `fetchMaxDistance=16384`.
+   Defaults already `teamScoped=false`, `showUnexploredTerrain=true`.
+3. `ExploredSync`/`ExploredPayload`: always send the "explored by anyone" set even when painting is unrestricted (it is how the client
+   knows what it may fetch). Add `shareProtocol` = `DhApi.getNetworkProtocolVersion()` (0 = no sharing: no DH on server or sharing off).
+   The client fetches only if it equals its own.
+4. Payloads on the existing optional registrar: `SectionRequestPayload(dim, long[] leafPos)` client->server;
+   `SectionDataPayload(dim, List<(long pos, byte[] dto /* empty = missing */)>)` server->client, each under 512 KB.
+5. `server/ShareServer`: on the server thread drop requests if sharing is off, DH is absent, or the per-player queue is over 256.
+   Validate each section: the viewer's sources (everyone in open mode; team + allies in team mode) explored at least one of its 16 chunks.
+   One daemon worker: `repo.getByKey(DhSectionPos.encode((byte)6, tx, tz))` -> `dto.encode(Unpooled.buffer())` -> `dto.close()`; send via `server.execute`.
+   Token buckets: per player `shareKBps`, global `shareGlobalKBps`.
+6. `client/ShareFetch`:
+   - `regionHasHighlights` is true when DH has the region OR (sharing on) at least one allowed bit exists there.
+   - `computeRegion` queues leaf sections that have an allowed chunk but no DH index bit.
+   - Only for the attached dimension, within `fetchMaxDistance` of the player, never in singleplayer (`hasSingleplayerServer()`).
+   - Nearest first, deduped; session sets of requested and missing sections.
+   - Batches of 32, at most 64 sections in flight.
+   - Receive on a worker: decode, create, `updateDataSourcesAsync`, close.
+7. SelfCheck: section validation against bitsets, token bucket, batch splitting.
+
+Cases: server without DH -> shareProtocol 0, client paints only its own DH. Server without MapHorizons -> no channel, `paintWithoutServer`.
+Team mode: requests validated against team + allies; already-fetched sections stay in the client's DH store (not a security boundary).
+Open mode: everyone's exploration is fetchable by everyone (say so in the config comment). Nether and other dimensions work per dimension.
+Freshness: fetched sections stay as fetched until the player is within DH range again. Clock skew affects refresh the same way as DH's own data.
+
+Unverified until run: real encoded size, whether DH drops/regenerates inserted far sections, listener behaviour on inserted data,
+concurrent server `getByKey` reads, whether the server keeps all dimension levels loaded.
+Upgrade path if bandwidth bites (option C): server decodes and sends surface-only data (~7-10x smaller) to its own client store.
+
+### Implementation notes (v1.1, as built)
+
+- Built as designed. Deviations: the server answers invalid (not explored by the viewer's scope) or wrong-detail
+  positions immediately as "missing" so the client does not wait for a timeout; requests are served in batches of 8
+  per player with at most one batch in flight; client requests time out after 60 s and regions are re-scanned every
+  30 s (exploration grows). Payload/class names: `SectionRequestPayload` (max 32 positions), `SectionDataPayload`
+  (each packet under 480 KB), `server/ShareServer`, `client/ShareFetch`, pure `share/TokenBucket` and
+  `share/ShareMath`. `ExploredPayload` replaces `anyoneSent` with `paintUnexplored` and adds `shareProtocol`;
+  "explored by anyone" is always sent, and fetchable = `mine` (team/open) or `anyone` (full atlas).
+- Measured in the Testing world's DH DB (23,265 leaf rows, mostly first-pass data): stored section blobs average
+  ~16.7 KB (max ~102 KB), so a Xaero region is ~1 MB and 512 KB/s is ~30 sections/s per player.

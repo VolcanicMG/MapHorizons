@@ -7,6 +7,7 @@ import com.seibel.distanthorizons.api.interfaces.block.IDhApiBlockStateWrapper;
 import com.seibel.distanthorizons.api.interfaces.world.IDhApiLevelWrapper;
 import com.seibel.distanthorizons.api.methods.events.abstractEvents.DhApiLevelUnloadEvent;
 import com.seibel.distanthorizons.api.methods.events.sharedParameterObjects.DhApiEventParam;
+import com.seibel.distanthorizons.api.enums.worldGeneration.EDhApiWorldGenerationStep;
 import com.seibel.distanthorizons.api.objects.DhApiResult;
 import com.seibel.distanthorizons.api.objects.data.DhApiTerrainDataPoint;
 import com.seibel.distanthorizons.core.api.internal.SharedApi;
@@ -16,6 +17,10 @@ import com.seibel.distanthorizons.core.file.fullDatafile.V2.FullDataSourceProvid
 import com.seibel.distanthorizons.core.level.IDhClientLevel;
 import com.seibel.distanthorizons.core.level.IDhLevel;
 import com.seibel.distanthorizons.core.pos.DhSectionPos;
+import com.seibel.distanthorizons.core.sql.dto.FullDataSourceV2DTO;
+import com.seibel.distanthorizons.core.util.objects.DataCorruptedException;
+import io.netty.buffer.Unpooled;
+import java.io.IOException;
 import com.seibel.distanthorizons.core.world.AbstractDhWorld;
 import com.seibel.distanthorizons.core.wrapperInterfaces.world.IClientLevelWrapper;
 import com.volcanicmg.maphorizons.Bits;
@@ -26,6 +31,7 @@ import com.volcanicmg.maphorizons.client.RegionColours;
 import com.volcanicmg.maphorizons.client.TerrainMath;
 import com.volcanicmg.maphorizons.client.xaero.XaeroColours;
 import java.util.ArrayList;
+import it.unimi.dsi.fastutil.bytes.ByteArrayList;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
@@ -60,6 +66,10 @@ public final class DhSource {
     private static final Logger LOG = LogUtils.getLogger();
     private static final byte LEAF = 6;
     private static final int TILES = RegionColours.SIZE / 64;
+    // Columns below FEATURES come from DH's rough surface pass (SURFACE_THEN_CHUNKS), stored as blocky squares.
+    private static final byte FULL_STEP = EDhApiWorldGenerationStep.FEATURES.value;
+    // Blur radius covers DH's largest coarse squares (16 columns).
+    private static final int COARSE_BLUR = 8;
 
     /**
      * One attached DH level. {@code colours} is the client level wrapper (DH's colour lookup only works there);
@@ -80,6 +90,7 @@ public final class DhSource {
     private static volatile boolean disabled;
     private static volatile boolean readFailureLogged;
     private static volatile boolean colourFailureLogged;
+    private static volatile boolean insertFailureLogged;
     private static final RegionColours.Result NOTHING = new RegionColours.Result(null, false);
     // Ticks spent failing to attach the current level, to log one "not found" line instead of spam.
     private static int attachTries;
@@ -143,6 +154,7 @@ public final class DhSource {
             // One refresh per region per tick, however many sections DH streamed in.
             regions.forEach((dim, keys) -> keys.forEach((long key) ->
                     RegionColours.refresh(dim, Bits.unpackX(key), Bits.unpackZ(key))));
+            RegionColours.flushDeferred();
         } catch (RuntimeException | LinkageError e) {
             disable(e);
         }
@@ -277,6 +289,78 @@ public final class DhSource {
         return a != null && a.ceiling();
     }
 
+    /**
+     * Reads a stored section straight from the DH database. Unlike {@code provider.get}, this never sends DH's
+     * sync-on-load request to the server (which rejects far sections). Null if missing.
+     */
+    private static FullDataSourceV2 read(Attached a, long pos) {
+        try (FullDataSourceV2DTO dto = a.provider().repo.getByKey(pos)) {
+            return dto == null ? null : dto.createDataSource(a.level().getLevelWrapper(), null);
+        } catch (IOException | InterruptedException | DataCorruptedException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** DH's network protocol on this client, compared with the server's before fetching; 0 if unknown. */
+    public static int protocol() {
+        try {
+            return disabled ? 0 : DhApi.getNetworkProtocolVersion();
+        } catch (RuntimeException | LinkageError e) {
+            return 0;
+        }
+    }
+
+    /** The dimension currently attached, or null. Main thread. */
+    public static ResourceLocation attachedDimension() {
+        ClientLevel mc = Minecraft.getInstance().level;
+        if (mc == null) return null;
+        Attached a = LEVELS.get(mc.dimension().location());
+        return a != null && a.mcLevel() == mc ? mc.dimension().location() : null;
+    }
+
+    public static long leafPos(int tx, int tz) {
+        return DhSectionPos.encode(LEAF, tx, tz);
+    }
+
+    public static double leafCentreX(long pos) {
+        return DhSectionPos.getX(pos) * 64 + 32;
+    }
+
+    public static double leafCentreZ(long pos) {
+        return DhSectionPos.getZ(pos) * 64 + 32;
+    }
+
+    /** Any thread: does DH have data for this leaf tile (64x64 blocks). */
+    public static boolean hasTile(ResourceLocation dim, int tx, int tz) {
+        Long2LongOpenHashMap idx = INDEX.get(dim);
+        return idx != null && (idx.get(Bits.tileRegionKey(tx, tz)) & Bits.tileBit(tx, tz)) != 0;
+    }
+
+    /**
+     * Worker: inserts a section received from the server through DH's own ingest path (merge by generation step,
+     * save, update listeners). The listener then indexes and repaints it. Dropped if the level changed.
+     */
+    public static void insert(ResourceLocation dim, byte[] encoded) {
+        Attached a = LEVELS.get(dim);
+        if (disabled || a == null) return;
+        try (FullDataSourceV2DTO dto = FullDataSourceV2DTO.CreateEmptyDataSourceForDecoding()) {
+            dto.decode(Unpooled.wrappedBuffer(encoded));
+            if (LEVELS.get(dim) != a) return;
+            FullDataSourceV2 src = dto.createDataSource(a.level().getLevelWrapper(), null);
+            try {
+                a.level().updateDataSourcesAsync(src).whenComplete((v, e) -> src.close());
+            } catch (Throwable t) {
+                src.close();
+                throw t;
+            }
+        } catch (LinkageError e) {
+            disable(e);
+        } catch (Exception e) {
+            if (!insertFailureLogged) LOG.warn("MapHorizons: a shared Distant Horizons section could not be stored; skipping", e);
+            insertFailureLogged = true;
+        }
+    }
+
     /** One DH (state, biome) pair; wrappers are interned by DH, so identity equality is fine. */
     private record ColourKey(IDhApiBlockStateWrapper state, IDhApiBiomeWrapper biome) {
     }
@@ -313,6 +397,9 @@ public final class DhSource {
         final int[] floor = new int[n * n];
         final int[] depth = new int[n * n];
         final boolean[] liquid = new boolean[n * n];
+        // DH's rough first pass (generation step below FEATURES): shaded from a smoothed height field.
+        final boolean[] coarse = new boolean[n * n];
+        boolean anyCoarse;
         // Heights of the row north of and the column west of the region, so edges shade like the interior.
         final int[] north = new int[n];
         final int[] west = new int[n];
@@ -348,7 +435,7 @@ public final class DhSource {
                 if ((mask & 1L << t) == 0) continue;
                 int tx = rx * TILES + (t % TILES), tz = rz * TILES + (t / TILES);
                 // Fresh source per read; must be closed. Missing sections come back empty.
-                try (FullDataSourceV2 src = a.provider().get(DhSectionPos.encode(LEAF, tx, tz))) {
+                try (FullDataSourceV2 src = read(a, DhSectionPos.encode(LEAF, tx, tz))) {
                     if (src == null || src.isEmpty) {
                         emptyTiles++;
                         continue;
@@ -379,10 +466,14 @@ public final class DhSource {
         }
         int[] out = shadeAndPack(c, palette, xaero);
         int painted = 0;
-        for (int h : c.height) if (h != Integer.MIN_VALUE) painted++;
+        int coarse = 0;
+        for (int i = 0; i < c.height.length; i++) {
+            if (c.height[i] != Integer.MIN_VALUE) painted++;
+            if (c.coarse[i]) coarse++;
+        }
         // Holes inside painted areas: "empty" = DH has the section indexed but no data in it yet.
-        debug("region {} {},{}: {} sections indexed, {} empty, {} columns painted, {} colours ({}), {} ms", dim, rx, rz,
-                Long.bitCount(mask), emptyTiles, painted, c.keys.size(), xaero ? "xaero" : "dh",
+        debug("region {} {},{}: {} sections indexed, {} empty, {} columns painted ({} coarse), {} colours ({}), {} ms",
+                dim, rx, rz, Long.bitCount(mask), emptyTiles, painted, coarse, c.keys.size(), xaero ? "xaero" : "dh",
                 (System.nanoTime() - started) / 1_000_000);
         return new RegionColours.Result(painted > 0 ? out : null, emptyTiles > 0);
     }
@@ -399,6 +490,7 @@ public final class DhSource {
         int n = c.n;
         double strength = Config.SHADE_STRENGTH.get();
         int[] out = new int[n * n];
+        double[] smooth = c.anyCoarse ? TerrainMath.blur(c.height, n, COARSE_BLUR) : null;
         for (int z = 0; z < n; z++)
             for (int x = 0; x < n; x++) {
                 int i = z * n + x;
@@ -410,6 +502,13 @@ public final class DhSource {
                             && bs.getFluidState().is(FluidTags.LAVA);
                     if (xaero && !lava && c.floor[i] >= 0) rgb = TerrainMath.blendWater(rgb, palette[c.floor[i]], c.depth[i]);
                     else rgb = TerrainMath.darkenLiquid(rgb, c.depth[i]);
+                }
+                if (c.coarse[i]) {
+                    // Gentle gradient across DH's blocky first-pass squares instead of a stair grid.
+                    double sN = z > 0 && c.height[i - n] != Integer.MIN_VALUE ? smooth[i - n] : smooth[i];
+                    double sW = x > 0 && c.height[i - 1] != Integer.MIN_VALUE ? smooth[i - 1] : smooth[i];
+                    out[i] = TerrainMath.pack(TerrainMath.shade(rgb, smooth[i], sN, sW, strength), 255);
+                    continue;
                 }
                 int hN = z > 0 ? c.height[i - n] : c.north[x];
                 int hW = x > 0 ? c.height[i - 1] : c.west[z];
@@ -436,12 +535,18 @@ public final class DhSource {
                                      boolean dh) {
         int w = Math.min(64, src.getWidthInDataColumns());
         int x0 = tx * 64, z0 = tz * 64;
+        ByteArrayList steps = src.columnGenerationSteps;
         for (int z = 0; z < w; z++)
             for (int x = 0; x < w; x++) {
                 Column col = Column.of(src.getApiDataPointColumn(x, z), a);
                 if (col == null) continue;
                 int bx = x0 + x, bz = z0 + z;
                 int i = (bz - rz * c.n) * c.n + (bx - rx * c.n);
+                int si = FullDataSourceV2.relativePosToIndex(x, z);
+                if (steps != null && si < steps.size() && steps.getByte(si) < FULL_STEP) {
+                    c.coarse[i] = true;
+                    c.anyCoarse = true;
+                }
                 c.height[i] = col.height();
                 c.surface[i] = keyId(c, a, src, col.surface(), bx, bz, dh);
                 c.liquid[i] = col.liquid();
@@ -461,7 +566,7 @@ public final class DhSource {
     private static void edge(Attached a, Long2LongOpenHashMap idx, int tx, int tz, boolean southRow, int[] into,
                              int offset) {
         if ((idx.get(Bits.tileRegionKey(tx, tz)) & Bits.tileBit(tx, tz)) == 0) return;
-        try (FullDataSourceV2 src = a.provider().get(DhSectionPos.encode(LEAF, tx, tz))) {
+        try (FullDataSourceV2 src = read(a, DhSectionPos.encode(LEAF, tx, tz))) {
             if (src == null || src.isEmpty) return;
             int w = Math.min(64, src.getWidthInDataColumns());
             for (int j = 0; j < w; j++) {
