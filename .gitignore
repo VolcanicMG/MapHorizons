@@ -39,3 +39,7 @@ run/
 repo/
 !**/src/**/repo/
 libs/
+
+# Claude Code local state
+.claude/worktrees/
+.claude/settings.local.json
